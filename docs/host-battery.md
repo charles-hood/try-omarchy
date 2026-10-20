@@ -25,7 +25,8 @@ half-informed:
 {"type":"state","present":true,"percentage":57,"state":"discharging",
  "acConnected":false,"timeToEmptySeconds":8100,"timeToFullSeconds":null,
  "chargeLimit":95,"chargeNowMicroAh":2832900,"chargeFullMicroAh":4970000,
- "chargeFullDesignMicroAh":6075000,"voltageMicroV":12537000,"cycleCount":213}
+ "chargeFullDesignMicroAh":6075000,"voltageMicroV":12537000,"cycleCount":213,
+ "currentMicroA":1500000}
 ```
 
 `state` is one of `charging`, `discharging`, `full`, `not-charging`,
@@ -36,22 +37,28 @@ estimate. A Mac with no internal battery sends `"present":false` with
 
 `macos/Sources/OmarchyVMHelper/NativeBatteryBridge.swift` builds these
 snapshots from `IOPSCopyPowerSourcesInfo` and `IOPSGetPowerSourceDescription`,
-and sends one on every coalesced IOKit change and every 30 seconds regardless,
-as a safety net against a missed notification. A guest opening the virtio port
-is not observable on the host's socket chardev, so
+and observes `kIOPSNotifyAnyPowerSource` on its state dispatch queue. This
+includes charging-only changes while percentage and time estimates stay the
+same, such as charging starting after the adapter connects. The IOPS run-loop
+convenience notification covers percentage, time, and source changes only.
+Unchanged snapshots are coalesced; a complete snapshot is also sent every
+30 seconds as a safety net against a missed notification. A guest opening the
+virtio port is not observable on the host's socket chardev, so
 `omarchy-native-battery-bridge`, the guest agent, sends one request line on
-start, `{"type":"refresh","chargeLimit":true,"batteryDetails":true}`, and the host answers with a fresh snapshot. The
-host ignores any other guest input.
+start, `{"type":"refresh","chargeLimit":true,"batteryDetails":true,"batteryCurrent":true}`,
+and the host answers with a fresh snapshot. The host ignores any other guest
+input. Updates follow the readings macOS publishes; plugging into AC does not
+mean charging when macOS holds the battery at a limit or pauses charging.
 
 ## Sysfs contract
 
-The DKMS module `try-omarchy-battery` (`guest/native-module/try-omarchy-battery/`)
+The DKMS module `try-omarchy-battery` (`guest/package/try-omarchy/battery/`)
 exposes one writable attribute,
 `/sys/devices/platform/try-omarchy-battery/state`, mode 0600 root-only. The
 guest agent writes it as one whole snapshot per write:
 
 ```text
-present=1 status=discharging capacity=57 ac=0 time_to_empty=8100 time_to_full=-1 charge_limit=95 charge_now=2832900 charge_full=4970000 charge_full_design=6075000 voltage_now=12537000 cycle_count=213
+present=1 status=discharging capacity=57 ac=0 time_to_empty=8100 time_to_full=-1 charge_limit=95 charge_now=2832900 charge_full=4970000 charge_full_design=6075000 voltage_now=12537000 cycle_count=213 current_now=1500000
 present=0 ac=1
 ```
 
@@ -93,19 +100,15 @@ This change does not alter the upstream bar layout or make that conditional
 row visible while charging or discharging. On disconnect, the guest clears
 the limit along with the time estimates.
 
-Existing guests can use **Update and Launch** to build and load the 1.2.0
-module and restart the agent. The update reloads an older loaded
-module; integration status checks the loaded version as well as the DKMS build.
-
 ## Time estimates
 
 The module publishes the host's estimates as `time_to_empty_avg` and
-`time_to_full_avg` under `/sys/class/power_supply/BAT0/`. The pinned
-`upower 1.91.4` does not read those two properties. It can estimate time from
-changes in the mirrored charge readings after collecting enough history; this
-is a guest estimate, not the Mac's time estimate. Percentage, charge state and
-AC presence remain independent. Tools that read sysfs directly, such as `acpi`
-and fastfetch, show the host estimates.
+`time_to_full_avg` under `/sys/class/power_supply/BAT0/`. UPower 1.91.4 does
+not read those two properties. It estimates time from the
+mirrored current and charge readings when available, or from charge history
+otherwise; this is a guest estimate, not the Mac's time estimate. Percentage,
+charge state and AC presence remain independent. Tools that read sysfs directly,
+such as `acpi` and fastfetch, show the host estimates.
 
 ## Battery size and cycles
 
@@ -131,24 +134,51 @@ Each field is an integer or `null`; unavailable physical readings are not
 invented. Missing fields from an older host are accepted and cleared, and a
 disconnect clears all five readings with `-1` in the module state. New hosts
 send extra fields only after opt-in, so original and charge-limit-only guest
-agents keep their existing wire schemas. Existing guests need the updated
-integration installed and the updated Mac bridge running to receive these
-readings.
+agents keep their existing wire schemas.
+
+## Live charging and discharge power
+
+Module 1.3.0 also publishes `current_now`. The guest requests `currentMicroA`
+with the separate `batteryCurrent` opt-in, so older agents that reject extra
+keys still receive their original schema. The host converts the Mac's signed
+`Amperage` reading from mA to a non-negative µA magnitude; charging direction
+comes from the IOPS state. `InstantAmperage` is a fallback when the averaged
+reading is unavailable. A valid zero remains zero; unavailable readings are
+`null` on the wire and `-1` in the module state. Older host snapshots and bridge
+disconnects clear the reading.
+
+The panel's `omarchy-battery-status` command uses `current_now` with
+`voltage_now` to calculate live power, refreshing every five seconds while open. This reports power entering or leaving the battery, not the charger's
+rated wattage or the Mac's total power consumption. It updates when macOS
+publishes a changed reading, including when percentage and charging state have
+not changed. UPower also consumes these readings, but deliberately suppresses
+its own power estimate for ten seconds after an AC transition, then restores it
+on its next refresh. The panel's sysfs power reading avoids that delay.
+
+The earlier pinned guest patched Omarchy's battery model so it trusted the
+reported charging state instead of inferring a charge-limit hold from zero
+watts or a long time estimate. The current guest runs Omarchy's own shell
+unpatched, so that patch is not carried over; whether the stock model shows
+**Holding** in those cases has not been checked yet.
+
+## Verification
+
+`make test` covers notification delivery without a main run loop, changes to
+charging state and current at a fixed percentage, optional-field negotiation,
+signed current conversion, guest stream processing, and the module parser.
+
+The opt-in smoke test that booted the factory directly to check the module,
+udev and UPower has not been ported to the UEFI factory yet. In a running VM
+the guest showed the Mac's battery percentage. Verify charging changes by
+plugging and unplugging the Mac while the bar and power panel are visible.
 
 ## Power profile
 
-The battery panel shows one selected **Managed by macOS** profile button with the
-Apple logo, sized to its content and native padding. It accepts no mouse or
-keyboard interaction. The menu's power-profile provider shows **Default,
-managed by macOS** as informational text. Linux power profiles cannot control
-the Mac's CPU or energy policy through QEMU/HVF. Change energy modes in macOS
-System Settings; the guest does not mirror the Mac's current energy mode.
-
-The guest profile commands expose only `default`. Startup and AC/battery
-transitions leave power policy alone, and requests for Linux performance modes
-are rejected. No `power-profiles-daemon` package or host control bridge is needed.
-The app's boot settings payload applies this presentation to matching existing
-guest files on the next launch, preserving customized or unrecognized files.
+Linux power profiles cannot control the Mac's CPU or energy policy through
+QEMU/HVF; change energy modes in macOS System Settings. The earlier pinned
+guest replaced Omarchy's profile controls with a single **Managed by macOS**
+entry. That presentation is not carried over to the current guest, which shows
+Omarchy's stock power-profile controls.
 
 ## Critical battery policy
 
@@ -161,7 +191,7 @@ CriticalPowerAction=Ignore
 ```
 
 Both are required. Setting only `CriticalPowerAction=Ignore` is not enough:
-the pinned `upower 1.91.4` classifies `Ignore` itself as a risky action, and
+UPower 1.91.4 classifies `Ignore` itself as a risky action, and
 without `AllowRiskyCriticalPowerAction=true` it silently refuses to honor the
 setting and falls back through HybridSleep, then Hibernate, then PowerOff —
 the guest would suspend or shut itself down on a low reading with no warning
@@ -178,57 +208,14 @@ second warning at 5%; critical urgency describes the 10% notification.
 The `battery-low` hook runs with the percentage. The bundled warning-sound hook
 is a `.sample` file and is disabled until the user enables it.
 
-## Retrofitting an existing guest
+## Packaging
 
-App updates keep an existing guest's persistent disk, so an already-running VM
-does not get the new kernel module from an app update alone — it does get the
-virtio port immediately, because QEMU's command line comes from the host at
-launch. No factory reset is needed: images from v0.3.0 onward carry `dkms`,
-`gcc`, `make`, `kmod`, and headers matching the pinned kernel, so the guest can
-build the module itself.
-
-Choose **Update and Launch** to build and install the battery integration
-automatically against the VM's current kernel. Missing build tools or matching
-headers are skipped, without downloading packages. Verified file and module/service
-recovery are described in [VM integrations](integration-updates.md#updates-at-launch).
-
-For the existing manual fallback, open
-**Setup > Try Omarchy Integrations** inside Omarchy, and choose
-**Manually install/repair integration support (fallback)**. The integration runs
-`guest/scripts/install-battery-into-existing-guest.sh` from the app's read-only
-integration bundle. It installs eight files (the three DKMS sources under
-`/usr/src/try-omarchy-battery-1.2.0/`, the bridge and its unit, and the udev,
-module-load, and UPower drop-ins), runs `dkms install try-omarchy-battery/1.2.0`,
-loads the module, reloads udev, and enables
-`omarchy-native-battery-bridge.service`. Because the module is installed
-through DKMS, the pacman DKMS hook rebuilds it whenever a later `pacman -Syu`
-bumps the guest kernel, so the retrofit survives guest kernel updates — a
-factory reset is never required.
-
-A guest whose files, DKMS build, and loaded module already match the current
-integration is left untouched. Older battery integrations are upgraded. When the module cannot be built — no DKMS on an
-image before v0.3.0, or a kernel update that has not been followed by a restart
-— the battery reports `disabled` with the reason and the other integrations
-still install.
-
-Without the integration bundle, the same script can run against files staged
-through the shared Mac folder instead of the network. Stage these repo paths,
-preserving the layout:
-
-```text
-native-module/try-omarchy-battery/{try-omarchy-battery.c,Makefile,dkms.conf}
-native-overlay/usr/local/bin/omarchy-native-battery-bridge
-native-overlay/usr/lib/systemd/system/omarchy-native-battery-bridge.service
-native-overlay/etc/udev/rules.d/95-omarchy-native-battery.rules
-native-overlay/etc/modules-load.d/95-try-omarchy-battery.conf
-native-overlay/etc/UPower/UPower.conf.d/90-try-omarchy.conf
-```
-
-Then, in the guest:
-
-```sh
-sudo ~/<folder>/battery-retrofit/install-battery-into-existing-guest.sh
-```
+The `try-omarchy` package ships the module source in
+`/usr/src/try-omarchy-battery-1.3.0/`, the bridge
+(`/usr/bin/omarchy-native-battery-bridge`) and its unit, the udev and
+module-load rules, and the UPower drop-in. The package depends on `dkms` and
+`linux-omarchy-headers`, so pacman's DKMS hook builds the module when the
+package is installed and again whenever `omarchy update` brings a new kernel.
 
 ## Failure modes
 
@@ -237,8 +224,8 @@ All are non-fatal to the VM, matching the camera bridge's posture:
 | Condition | Behavior |
 | --- | --- |
 | Mac has no internal battery | `present:false`; guest keeps `ADP0` only; bar shows nothing |
-| Host bridge dies | Agent writes `status=unknown`, exits; systemd restarts it; launcher restarts the bridge |
-| Module absent (un-retrofitted guest) | The unit's `ConditionPathExists` on the sysfs attribute fails; the agent never starts, and a later retrofit brings it up |
+| Host bridge dies | Agent writes `present=0 ac=1`, so the guest shows no battery until the next snapshot; exits; systemd restarts it; launcher restarts the bridge |
+| Module absent (DKMS build failed or pending a reboot after a kernel update) | The unit's `ConditionPathExists` on the sysfs attribute fails; the agent does not start |
 | Malformed JSON line or state line | Rejected; previous state retained |
 | Host sleep and wake | Fresh snapshot on the next notification or the 30-second tick |
 | Critically low Mac battery | Omarchy warns; the VM does not suspend or power off |
